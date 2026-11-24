@@ -10,18 +10,36 @@ client = Groq()
 # Free-plan models on Groq. If one fails, try the next.
 MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
+# Memory: how many past messages the agent remembers (10 = last 5 questions + answers).
+# Kept small because the free plan allows only ~8,000 tokens per minute.
+MAX_HISTORY = 10
+
 SYSTEM_PROMPT = (
     "You are a research assistant. "
     "Use web_search for news, current events, prices, or any fact you are not sure about. "
     "Use get_current_time when you need today's date or time. "
-    "Only state facts you got from tools, and list the source links at the end. "
-    "If the tools don't give you the answer, say you don't know. Never guess."
+    "Only state facts you got from tools or from earlier in this conversation, "
+    "and list the source links at the end. "
+    "Use the earlier conversation to understand follow-up questions like 'tell me more about it'. "
+    "If you don't have the answer, say you don't know. Never guess."
 )
 
 
 # ---- 1. Tools: normal Python functions ----
 def get_current_time() -> str:
     return datetime.datetime.now().strftime("%A, %Y-%m-%d %H:%M:%S")
+
+
+def calculate(expression: str) -> str:
+    # eval() can run any Python code, so only allow numbers and math symbols.
+    # "**" (power) is blocked too, because something like 9**9**9 would freeze the laptop.
+    allowed = "0123456789+-*/(). "
+    if not all(ch in allowed for ch in expression) or "**" in expression:
+        return "Error: only numbers and + - * / ( ) are allowed."
+    try:
+        return str(eval(expression))
+    except Exception as e:
+        return f"Error: {e}"
 
 
 def web_search(query: str) -> str:
@@ -59,6 +77,24 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+        {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Calculates a math expression, e.g. '25 * 4 + 10'. "
+            "Use it for any arithmetic instead of doing math yourself.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "A math expression with numbers and + - * / ( ) only",
+                    }
+                },
+                "required": ["expression"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -82,6 +118,7 @@ TOOLS = [
 # Tool name -> the real Python function to run.
 AVAILABLE_FUNCTIONS = {
     "get_current_time": get_current_time,
+    "calculate": calculate,
     "web_search": web_search,
 }
 
@@ -118,18 +155,24 @@ def call_model(messages):
 
 
 # ---- 3. The agent loop: think -> use a tool -> look at the result -> answer ----
-def run_agent(question, max_steps=6):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+def run_agent(question, history, max_steps=6):
+    # Rules first, then the memory (earlier questions + answers), then the new question.
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += history
+    messages.append({"role": "user", "content": question})
 
     for _ in range(max_steps):
         message = call_model(messages).choices[0].message
 
         # No tool requested -> this is the final answer.
         if not message.tool_calls:
-            return message.content
+            answer = message.content
+            # Save only the question and the final answer to memory.
+            # The tool calls and search results are left out, so memory stays small.
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": answer})
+            del history[:-MAX_HISTORY]  # forget the oldest messages beyond the limit
+            return answer
 
         # Remember that the model asked for these tools.
         messages.append(
@@ -159,11 +202,17 @@ def run_agent(question, max_steps=6):
     return "Stopped: too many steps without a final answer."
 
 
-# ---- 4. Chat with the agent: type a question, or 'exit' to quit ----
+# ---- 4. Chat with the agent (with memory) ----
 if __name__ == "__main__":
+    history = []  # the agent's memory: created once, kept across all questions
+    print("Ask a question. Type 'reset' to clear memory, 'exit' to quit.")
     while True:
         question = input("\nYou: ").strip()
         if question.lower() in ("exit", "quit"):
             break
+        if question.lower() == "reset":
+            history.clear()
+            print("(memory cleared)")
+            continue
         if question:
-            print("\nAgent:", run_agent(question))
+            print("\nAgent:", run_agent(question, history))
