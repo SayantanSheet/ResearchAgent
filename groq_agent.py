@@ -1,5 +1,6 @@
 import datetime
 import json
+import os
 
 from dotenv import load_dotenv
 from groq import APIStatusError, Groq
@@ -10,9 +11,15 @@ client = Groq()
 # Free-plan models on Groq. If one fails, try the next.
 MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
+# Models that can use Groq's built-in browser_search, tried in this order.
+SEARCH_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+
 # Memory: how many past messages the agent remembers (10 = last 5 questions + answers).
 # Kept small because the free plan allows only ~8,000 tokens per minute.
 MAX_HISTORY = 10
+
+# Long-term memory: the conversation is saved in this file, so it survives a restart.
+MEMORY_FILE = "memory.json"
 
 SYSTEM_PROMPT = (
     "You are a research assistant. "
@@ -44,27 +51,42 @@ def calculate(expression: str) -> str:
 
 def web_search(query: str) -> str:
     # The search runs on Groq's servers (its built-in "browser_search" tool),
-    # so our own slow network doesn't matter. Our tool asks a second, smaller
-    # model to do the searching: one agent using another agent as its tool.
-    try:
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Search the web for: {query}\n"
-                    "Reply with the key facts as short bullet points. "
-                    "Put the source URL after each fact.",
-                }
-            ],
-            tools=[{"type": "browser_search"}],
-            tool_choice="required",
-            reasoning_effort="low",  # Groq recommends low, so searches stay short
-        )
-        return response.choices[0].message.content or "No results found."
-    except Exception as e:
-        print(f"[search error: {e}]")
-        return f"Search failed: {e}"
+    # so our own slow network doesn't matter. Our tool asks a second model
+    # to do the searching: one agent using another agent as its tool.
+    # Each model has its own daily token limit, so if one is used up, try the next.
+    for model in SEARCH_MODELS:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Search the web for: {query}\n"
+                        "Reply with the key facts as short bullet points. "
+                        "Put the source URL after each fact.",
+                    }
+                ],
+                tools=[{"type": "browser_search"}],
+                tool_choice="required",
+                reasoning_effort="low",  # Groq recommends low, so searches stay short
+            )
+            return response.choices[0].message.content or "No results found."
+        except APIStatusError as e:
+            if e.status_code in (429, 503):
+                print(f"[search: {model} limit reached, trying next model...]")
+                continue
+            print(f"[search error: {e}]")
+            return f"Search failed: {e}"
+        except Exception as e:
+            print(f"[search error: {e}]")
+            return f"Search failed: {e}"
+    # All search models are used up. Tell the main model clearly, so it
+    # doesn't keep trying again and again.
+    print("[search: all search models have reached their limit]")
+    return (
+        "Search is not available right now (daily limit reached). "
+        "Do not call web_search again. Tell the user to try again later."
+    )
 
 
 # ---- 2. Describe the tools, so the model knows what each does and when to use it ----
@@ -75,24 +97,6 @@ TOOLS = [
             "name": "get_current_time",
             "description": "Returns the current day of the week, date and time.",
             "parameters": {"type": "object", "properties": {}},
-        },
-    },
-        {
-        "type": "function",
-        "function": {
-            "name": "calculate",
-            "description": "Calculates a math expression, e.g. '25 * 4 + 10'. "
-            "Use it for any arithmetic instead of doing math yourself.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "A math expression with numbers and + - * / ( ) only",
-                    }
-                },
-                "required": ["expression"],
-            },
         },
     },
     {
@@ -113,13 +117,31 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Calculates a math expression, e.g. '25 * 4 + 10'. "
+            "Use it for any arithmetic instead of doing math yourself.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "A math expression with numbers and + - * / ( ) only",
+                    }
+                },
+                "required": ["expression"],
+            },
+        },
+    },
 ]
 
 # Tool name -> the real Python function to run.
 AVAILABLE_FUNCTIONS = {
     "get_current_time": get_current_time,
-    "calculate": calculate,
     "web_search": web_search,
+    "calculate": calculate,
 }
 
 
@@ -202,9 +224,28 @@ def run_agent(question, history, max_steps=6):
     return "Stopped: too many steps without a final answer."
 
 
-# ---- 4. Chat with the agent (with memory) ----
+# ---- 4. Long-term memory: save to / load from a JSON file ----
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        return []  # first run: nothing to remember yet
+    try:
+        with open(MEMORY_FILE, encoding="utf-8") as f:
+            return json.load(f)  # JSON text in the file -> Python list
+    except (json.JSONDecodeError, OSError):
+        print("(memory file is broken, starting fresh)")
+        return []
+
+
+def save_memory(history):
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        # Python list -> JSON text in the file
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+# ---- 5. Chat with the agent (with memory) ----
 if __name__ == "__main__":
-    history = []  # the agent's memory: created once, kept across all questions
+    history = load_memory()  # read old conversation from the file
+    print(f"(remembering {len(history) // 2} earlier questions)")
     print("Ask a question. Type 'reset' to clear memory, 'exit' to quit.")
     while True:
         question = input("\nYou: ").strip()
@@ -212,7 +253,9 @@ if __name__ == "__main__":
             break
         if question.lower() == "reset":
             history.clear()
+            save_memory(history)  # empty the file too
             print("(memory cleared)")
             continue
         if question:
             print("\nAgent:", run_agent(question, history))
+            save_memory(history)  # save after every answer
