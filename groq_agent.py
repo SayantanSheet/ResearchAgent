@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import APIStatusError, Groq
@@ -49,6 +50,35 @@ def calculate(expression: str) -> str:
         return f"Error: {e}"
 
 
+def clean_search_answer(message):
+    # gpt-oss adds citation marks like 【2†L4-L11】 that mean nothing to us. Remove them.
+    text = re.sub(r"【[^】]*】", "", message.content or "").strip()
+
+    # Groq also sends what the search tool really did, in message.executed_tools:
+    #  - "browser.search": the list of search results (all hits, read or not)
+    #  - "browser.open":   a page the model actually opened and read
+    titles = {}  # url -> title, from the search results
+    found = []  # every search hit
+    opened = []  # pages that were really opened and read
+    for tool in getattr(message, "executed_tools", None) or []:
+        if tool.search_results and tool.search_results.results:
+            for r in tool.search_results.results:
+                if r.url:
+                    found.append(r.url)
+                    titles[r.url] = r.title or r.url
+        if "open" in tool.type:
+            match = re.search(r"URL: (\S+)", tool.output or "")
+            if match:
+                opened.append(match.group(1))
+
+    # Best sources = the pages it read. If it read none, use the top 3 search hits.
+    sources = list(dict.fromkeys(opened or found[:3]))  # dict.fromkeys removes duplicates
+    if sources:
+        text += "\n\nSources (use ONLY these links, never invent others):\n"
+        text += "\n".join(f"- {titles.get(url, url)}: {url}" for url in sources[:5])
+    return text or "No results found."
+
+
 def web_search(query: str) -> str:
     # The search runs on Groq's servers (its built-in "browser_search" tool),
     # so our own slow network doesn't matter. Our tool asks a second model
@@ -70,7 +100,8 @@ def web_search(query: str) -> str:
                 tool_choice="required",
                 reasoning_effort="low",  # Groq recommends low, so searches stay short
             )
-            return response.choices[0].message.content or "No results found."
+            message = response.choices[0].message
+            return clean_search_answer(message)
         except APIStatusError as e:
             if e.status_code in (429, 503):
                 print(f"[search: {model} limit reached, trying next model...]")
